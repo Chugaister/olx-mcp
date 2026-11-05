@@ -23,6 +23,15 @@ import {
 export abstract class BaseOlxScraper extends PlaywrightScraper<SearchFilters, SearchResult> {
   private static readonly URL_CACHE_LIMIT = 2000;
 
+  /**
+   * How long page.goto waits before scraping. Not 'networkidle': OLX pages keep
+   * ad requests (e.g. pagead2.googlesyndication.com) open indefinitely, so the
+   * network never goes idle and every navigation hits the timeout even though
+   * the listings rendered within ~2s. Each caller waits for the selectors it
+   * actually reads instead.
+   */
+  private static readonly NAVIGATION_WAIT = 'domcontentloaded';
+
   protected readonly domainConfig: DomainConfig;
   private readonly urlCache = new Map<string, string>(); // Maps listing ID to full URL
 
@@ -61,7 +70,7 @@ export abstract class BaseOlxScraper extends PlaywrightScraper<SearchFilters, Se
     return await this.withPage(async page => {
       const searchUrl = this.buildSearchUrl(filters);
 
-      await page.goto(searchUrl, { waitUntil: 'networkidle' });
+      await page.goto(searchUrl, { waitUntil: BaseOlxScraper.NAVIGATION_WAIT });
       await this.waitForSearchResults(page);
 
       if (signal?.aborted) {
@@ -134,6 +143,48 @@ export abstract class BaseOlxScraper extends PlaywrightScraper<SearchFilters, Se
     }
 
     return url.toString();
+  }
+
+  /**
+   * Waits for a listing page to be ready to read, now that navigation no
+   * longer waits for network idle.
+   *
+   * At domcontentloaded the server-rendered markup still carries Emotion's
+   * inline <style> tags inside the very elements read below (their CSS would
+   * leak into textContent), and client-rendered parts such as the location
+   * are not there yet. On olx.ua hydration takes ~0.3s and the location
+   * ~0.6s. Every step falls through on timeout: a missing field is not an
+   * error here, extraction then returns empty fields as it always has.
+   */
+  private async waitForListingDetails(page: Page): Promise<void> {
+    const { title, location } = this.domainConfig.selectors.detail;
+
+    await page.waitForSelector(title, { timeout: 10000 }).catch(() => {});
+
+    // Hydration moves the inline <style> tags out of the content. Pages that
+    // render without inline styles satisfy this immediately.
+    await page
+      .locator(`${title} style`)
+      .first()
+      .waitFor({ state: 'detached', timeout: 5000 })
+      .catch(() => {});
+
+    // The location section first holds only its heading; the place is
+    // rendered client-side, as a second non-style child. Listings without
+    // the section skip the wait.
+    if (await page.$(location)) {
+      await page
+        .locator(`${location} > :not(style) ~ :not(style)`)
+        .first()
+        .waitFor({ state: 'attached', timeout: 5000 })
+        .catch(() => {});
+    }
+
+    // Whatever inline CSS is still in the body (e.g. hydration timed out)
+    // must not end up in the extracted text.
+    await page
+      .$$eval('body style', styles => styles.forEach(style => style.remove()))
+      .catch(() => {});
   }
 
   private async waitForSearchResults(page: Page): Promise<void> {
@@ -334,13 +385,14 @@ export abstract class BaseOlxScraper extends PlaywrightScraper<SearchFilters, Se
       }
 
       // Navigate to the listing page
-      await page.goto(finalUrl, { waitUntil: 'networkidle' });
+      await page.goto(finalUrl, { waitUntil: BaseOlxScraper.NAVIGATION_WAIT });
 
       if (signal?.aborted) {
         throw new Error('Operation cancelled');
       }
 
       const detail = this.domainConfig.selectors.detail;
+      await this.waitForListingDetails(page);
       // Absent flags mean "include", matching the MCP tool schema defaults;
       // normalization happens once here so the branches below stay uniform.
       const includeImages = options.includeImages ?? true;
@@ -395,9 +447,10 @@ export abstract class BaseOlxScraper extends PlaywrightScraper<SearchFilters, Se
 
     try {
       await page.goto(`${this.domainConfig.baseUrl}${listingPath}q-${safeId}/`, {
-        waitUntil: 'networkidle',
+        waitUntil: BaseOlxScraper.NAVIGATION_WAIT,
         timeout: 15000,
       });
+      await this.waitForSearchResults(page);
 
       const href = await page
         .$$eval(
