@@ -68,6 +68,33 @@ describe('extractDescriptionText', () => {
   it('returns an empty string for an empty container', () => {
     expect(extractDescriptionText(element('DIV', '   '))).toBe('');
   });
+
+  it.each([
+    ['olx.ua', 'Опис', 'Стан майже як нові, користувався дуже рідко.'],
+    ['olx.pl', 'Opis', 'Mam do sprzedania Sony WH-1000XM4.'],
+    ['olx.pt', 'Descrição', 'Vendo auscultadores sem fios da Sony WH-1000XM4.'],
+  ])('drops the heading wrapped in its own block in the current %s markup', (_, heading, body) => {
+    // Current markup: <div data-testid="ad_description"><div><h3>Opis</h3></div><div>…</div></div>
+    const container = element('DIV', '', [
+      element('DIV', '', [element('H3', heading)]),
+      element('DIV', body),
+    ]);
+
+    expect(extractDescriptionText(container)).toBe(body);
+  });
+
+  it('keeps a body block that only contains line breaks between its text', () => {
+    // The description body holds text nodes separated by <br>s: its only child
+    // elements are not headings, so the block must not be mistaken for one.
+    const body = {
+      tagName: 'DIV',
+      textContent: 'Witam. Sprzęt jest na gwarancji.',
+      children: [element('BR', ''), element('BR', '')],
+    } as unknown as Element;
+    const container = element('DIV', '', [element('DIV', '', [element('H3', 'Opis')]), body]);
+
+    expect(extractDescriptionText(container)).toBe('Witam. Sprzęt jest na gwarancji.');
+  });
 });
 
 describe('extractDetailPriceText', () => {
@@ -165,6 +192,80 @@ describe('extractLocationText', () => {
     } as unknown as Element;
 
     expect(extractLocationText(container)).toBe('Plain location text.');
+  });
+
+  /**
+   * Current markup on olx.ua, olx.pl and olx.pt:
+   * <div data-testid="map-aside-section">
+   *   <p>Lokalizacja</p>
+   *   <section><div><svg/><div>
+   *     <p>Chrzanów, <span>district</span></p><p>Małopolskie</p><div/>
+   *   </div></div><button><img/></button></section>
+   * </div>
+   */
+  const currentLocation = (heading: string, lines: string[]) =>
+    ({
+      tagName: 'DIV',
+      children: [
+        element('P', heading),
+        element('SECTION', '', [
+          element('DIV', '', [
+            element('SVG', ''),
+            element('DIV', '', [...lines.map(line => element('P', line)), element('DIV', '')]),
+          ]),
+          element('BUTTON', '', [element('IMG', '')]),
+        ]),
+      ],
+      querySelector: () => null,
+    }) as unknown as Element;
+
+  it.each([
+    [
+      'olx.ua',
+      'Місцезнаходження',
+      ['Одеса, Приморський', 'Одеська область'],
+      'Одеса, Приморський, Одеська область',
+    ],
+    ['olx.pl', 'Lokalizacja', ['Chrzanów, ', 'Małopolskie'], 'Chrzanów, Małopolskie'],
+    ['olx.pt', 'Localização', ['Beato, ', 'Lisboa'], 'Beato, Lisboa'],
+  ])(
+    'reads the place, not the <p> heading, in the current %s markup',
+    (_, heading, lines, expected) => {
+      expect(extractLocationText(currentLocation(heading, lines))).toBe(expected);
+    }
+  );
+
+  it('normalises the spacing around the comma between city and district', () => {
+    expect(
+      extractLocationText(currentLocation('Lokalizacja', ['Kraków ,Podgórze', 'Małopolskie']))
+    ).toBe('Kraków, Podgórze, Małopolskie');
+  });
+
+  it('prefers the <address> block when the markup still has one', () => {
+    const address = element('ADDRESS', '', [element('P', 'Massamá E Monte Abraão, Lisboa')]);
+    const container = {
+      tagName: 'DIV',
+      children: [element('P', 'Localização'), element('SECTION', '', [element('P', 'Other')])],
+      querySelector: (selector: string) =>
+        selector === 'address' ? (address as unknown as Element) : null,
+    } as unknown as Element;
+
+    expect(extractLocationText(container)).toBe('Massamá E Monte Abraão, Lisboa');
+  });
+
+  it('falls back to the older heading-drop path when the section has no text lines', () => {
+    const container = {
+      tagName: 'DIV',
+      children: [
+        element('H2', 'Lokalizacja'),
+        element('SECTION', '', [element('DIV', '')]),
+        element('DIV', 'Warszawa'),
+      ],
+      textContent: 'LokalizacjaWarszawa',
+      querySelector: () => null,
+    } as unknown as Element;
+
+    expect(extractLocationText(container)).toBe('Warszawa');
   });
 });
 
